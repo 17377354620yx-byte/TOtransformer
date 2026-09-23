@@ -29,7 +29,15 @@ class MultiHeadAttention(nn.Module):
         self.dropout = build_dropout_layer(dropout)
 
     def forward(
-        self, input_q, input_k, input_v, key_weights=None, key_masks=None, attention_factors=None, attention_masks=None
+        self,
+        input_q,
+        input_k,
+        input_v,
+        key_weights=None,
+        key_masks=None,
+        attention_factors=None,
+        attention_masks=None,
+        attention_bias=None,
     ):
         """Vanilla Self-attention forward propagation.
 
@@ -52,6 +60,8 @@ class MultiHeadAttention(nn.Module):
         v = rearrange(self.proj_v(input_v), 'b m (h c) -> b h m c', h=self.num_heads)
 
         attention_scores = torch.einsum('bhnc,bhmc->bhnm', q, k) / self.d_model_per_head ** 0.5
+        if attention_bias is not None:
+            attention_scores = attention_scores + attention_bias
         if attention_factors is not None:
             attention_scores = attention_factors.unsqueeze(1) * attention_scores
         if key_weights is not None:
@@ -86,6 +96,7 @@ class AttentionLayer(nn.Module):
         memory_masks=None,
         attention_factors=None,
         attention_masks=None,
+        attention_bias=None,
     ):
         hidden_states, attention_scores = self.attention(
             input_states,
@@ -95,6 +106,7 @@ class AttentionLayer(nn.Module):
             key_masks=memory_masks,
             attention_factors=attention_factors,
             attention_masks=attention_masks,
+            attention_bias=attention_bias,
         )
         hidden_states = self.linear(hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -116,6 +128,7 @@ class TransformerLayer(nn.Module):
         memory_masks=None,
         attention_factors=None,
         attention_masks=None,
+        attention_bias=None,
     ):
         hidden_states, attention_scores = self.attention(
             input_states,
@@ -124,6 +137,7 @@ class TransformerLayer(nn.Module):
             memory_masks=memory_masks,
             attention_factors=attention_factors,
             attention_masks=attention_masks,
+            attention_bias=attention_bias,
         )
         output_states = self.output(hidden_states)
         return output_states, attention_scores

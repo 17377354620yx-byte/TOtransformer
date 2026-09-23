@@ -17,6 +17,7 @@ from geotransformer.modules.liver.fine_local_refiner import (
 from geotransformer.modules.liver.overlap_selection import select_overlap_region
 from geotransformer.modules.liver.topology_overlap import TopologyOverlapRefiner
 from geotransformer.modules.liver.cooperative_matching import mix_coarse_proposals
+from geotransformer.modules.liver.coarse_ranker import TopologyOverlapCoarseRanker
 from geotransformer.modules.ops import index_select, point_to_node_partition
 from geotransformer.modules.registration import get_node_correspondences
 from geotransformer.modules.sinkhorn import LearnableLogOptimalTransport
@@ -37,6 +38,18 @@ class GeoTransformer(nn.Module):
         self.matching_radius = float(cfg.model.ground_truth_matching_radius)
         self.rtor_enabled = bool(cfg.ablation.rtor_enabled)
         self.a3_enabled = bool(cfg.ablation.a3_enabled)
+        self.topology_attention_enabled = bool(
+            cfg.ablation.get('topology_attention', False)
+        )
+        self.overlap_cross_attention_enabled = bool(
+            cfg.ablation.get('overlap_cross_attention', False)
+        )
+        self.legacy_rtor_post_refine = bool(
+            cfg.ablation.get('legacy_rtor_post_refine', self.rtor_enabled)
+        )
+        self.coarse_ranking_enabled = bool(
+            cfg.ablation.get('coarse_ranking_enabled', False)
+        )
         self.overlap_soft_weight = bool(
             cfg.ablation.get('overlap_soft_weight', True)
         )
@@ -67,6 +80,11 @@ class GeoTransformer(nn.Module):
             cfg.geotransformer.sigma_a,
             cfg.geotransformer.angle_k,
             reduction_a=cfg.geotransformer.reduction_a,
+            topology_attention=self.topology_attention_enabled,
+            overlap_attention=self.overlap_cross_attention_enabled,
+            topology_num_neighbors=cfg.topology_overlap.num_neighbors,
+            topology_hidden_dim=cfg.topology_overlap.attention_hidden_dim,
+            poincare_curvature=cfg.topology_overlap.poincare_curvature,
         )
         self.coarse_target = SuperPointTargetGenerator(
             cfg.coarse_matching.num_targets,
@@ -75,6 +93,25 @@ class GeoTransformer(nn.Module):
         self.coarse_matching = SuperPointMatching(
             cfg.coarse_matching.num_correspondences,
             cfg.coarse_matching.dual_normalization,
+        )
+        self.coarse_ranker = (
+            TopologyOverlapCoarseRanker(
+                feature_dim=cfg.geotransformer.output_dim,
+                hidden_dim=cfg.coarse_ranking.hidden_dim,
+                num_neighbors=cfg.topology_overlap.num_neighbors,
+                poincare_curvature=cfg.topology_overlap.poincare_curvature,
+                dual_normalization=cfg.coarse_matching.dual_normalization,
+                overlap_score_floor=cfg.topology_overlap.score_floor,
+                overlap_score_power=cfg.topology_overlap.score_power,
+                use_overlap_prior=cfg.ablation.get(
+                    'coarse_overlap_prior_enabled', True
+                ),
+                use_topology_compatibility=cfg.ablation.get(
+                    'coarse_topology_compatibility_enabled', True
+                ),
+            )
+            if self.coarse_ranking_enabled
+            else None
         )
         self.fine_matching = LocalGlobalRegistration(
             cfg.fine_matching.topk,
@@ -110,7 +147,7 @@ class GeoTransformer(nn.Module):
             refine_descriptors=cfg.ablation.get(
                 'rtor_descriptor_update', True
             ),
-        ) if self.rtor_enabled else None
+        ) if self.rtor_enabled and self.legacy_rtor_post_refine else None
 
         self.overlap_score_floor = float(cfg.topology_overlap.score_floor)
         self.rtor_residual_scale = 1.0
@@ -135,17 +172,28 @@ class GeoTransformer(nn.Module):
             dtype=torch.bfloat16,
             enabled=autocast_enabled,
         ):
-            ref_feats_c, src_feats_c = self.transformer(
+            encoded = self.transformer(
                 ref_points_c.unsqueeze(0),
                 src_points_c.unsqueeze(0),
                 ref_feats_c.unsqueeze(0),
                 src_feats_c.unsqueeze(0),
             )
+        if self.topology_attention_enabled:
+            ref_feats_c, src_feats_c, diagnostics = encoded
+            diagnostics = {
+                key: value.float().squeeze(0)
+                for key, value in diagnostics.items()
+            }
+        else:
+            ref_feats_c, src_feats_c = encoded
+            diagnostics = None
         # Keep all RTOR, matching, loss and pose-estimation operations in FP32.
         ref_feats_c = ref_feats_c.float()
         src_feats_c = src_feats_c.float()
         ref_feats_c = F.normalize(ref_feats_c.squeeze(0), p=2, dim=1)
         src_feats_c = F.normalize(src_feats_c.squeeze(0), p=2, dim=1)
+        if self.topology_attention_enabled:
+            return ref_feats_c, src_feats_c, diagnostics
         return ref_feats_c, src_feats_c
 
     def _apply_rtor(
@@ -154,6 +202,7 @@ class GeoTransformer(nn.Module):
         src_points_c,
         ref_feats_c,
         src_feats_c,
+        conditioned_diagnostics=None,
     ):
         if not self.rtor_enabled:
             ref_probability = ref_feats_c.new_ones(len(ref_feats_c))
@@ -162,6 +211,38 @@ class GeoTransformer(nn.Module):
                                src_overlap_logits=torch.zeros_like(src_probability))
             return (ref_feats_c, src_feats_c, ref_probability, src_probability,
                     ref_probability, src_probability, diagnostics)
+        if not self.legacy_rtor_post_refine:
+            diagnostics = conditioned_diagnostics or {}
+            diagnostics.setdefault(
+                'ref_overlap_logits', ref_feats_c.new_zeros(len(ref_feats_c))
+            )
+            diagnostics.setdefault(
+                'src_overlap_logits', src_feats_c.new_zeros(len(src_feats_c))
+            )
+            ref_probability = torch.sigmoid(diagnostics['ref_overlap_logits'])
+            src_probability = torch.sigmoid(diagnostics['src_overlap_logits'])
+            if not self.overlap_cross_attention_enabled:
+                ref_probability = torch.ones_like(ref_probability)
+                src_probability = torch.ones_like(src_probability)
+            if self.overlap_soft_weight and self.overlap_cross_attention_enabled:
+                ref_weight = self.overlap_score_floor + (
+                    1.0 - self.overlap_score_floor
+                ) * ref_probability.pow(self.overlap_score_power)
+                src_weight = self.overlap_score_floor + (
+                    1.0 - self.overlap_score_floor
+                ) * src_probability.pow(self.overlap_score_power)
+            else:
+                ref_weight = torch.ones_like(ref_probability)
+                src_weight = torch.ones_like(src_probability)
+            return (
+                ref_feats_c,
+                src_feats_c,
+                ref_probability,
+                src_probability,
+                ref_weight,
+                src_weight,
+                diagnostics,
+            )
         original_ref, original_src = ref_feats_c, src_feats_c
         ref_feats_c, src_feats_c, diagnostics = self.topology_overlap_refiner(
             ref_points_c,
@@ -282,12 +363,17 @@ class GeoTransformer(nn.Module):
         src_feats_f = fine_features[ref_length_f:]
         ref_feats_c = coarse_features[:ref_length_c]
         src_feats_c = coarse_features[ref_length_c:]
-        ref_feats_c, src_feats_c = self._encode_coarse_features(
+        encoded_coarse = self._encode_coarse_features(
             ref_points_c,
             src_points_c,
             ref_feats_c,
             src_feats_c,
         )
+        if self.topology_attention_enabled:
+            ref_feats_c, src_feats_c, conditioned_diagnostics = encoded_coarse
+        else:
+            ref_feats_c, src_feats_c = encoded_coarse
+            conditioned_diagnostics = None
         (
             ref_feats_c,
             src_feats_c,
@@ -301,6 +387,7 @@ class GeoTransformer(nn.Module):
             src_points_c,
             ref_feats_c,
             src_feats_c,
+            conditioned_diagnostics,
         )
 
         # The partial reference remains intact. Only the complete source is
@@ -333,15 +420,32 @@ class GeoTransformer(nn.Module):
             src_feats_f=src_feats_f,
         )
 
+        ranking_scores = None
+        if self.coarse_ranker is not None:
+            ranking_scores, ranking_diagnostics = self.coarse_ranker(
+                ref_points_c,
+                src_points_c,
+                ref_feats_c,
+                src_feats_c,
+                ref_probability,
+                src_probability,
+                focused_ref_node_masks,
+                focused_src_node_masks,
+            )
+            output_dict.update(ranking_diagnostics)
+
         with torch.no_grad():
+            matching_ref_weights = ref_weight if ranking_scores is None else None
+            matching_src_weights = src_weight if ranking_scores is None else None
             ref_node_corr_indices, src_node_corr_indices, node_corr_scores = (
                 self.coarse_matching(
                     ref_feats_c,
                     src_feats_c,
                     focused_ref_node_masks,
                     focused_src_node_masks,
-                    ref_weights=ref_weight,
-                    src_weights=src_weight,
+                    ref_weights=matching_ref_weights,
+                    src_weights=matching_src_weights,
+                    precomputed_scores=ranking_scores,
                 )
             )
             output_dict.update(

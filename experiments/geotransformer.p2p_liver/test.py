@@ -42,7 +42,15 @@ def make_parser():
     parser.add_argument('--architecture', choices=['geotransformer', 'rtor_only', 'a3_only', 'rtor_a3'], default='rtor_a3')
     parser.add_argument('--registration_profile', choices=['legacy', 'tight', 'robust'], default='legacy')
     parser.add_argument('--dual_encoder', action='store_true')
-    parser.add_argument('--interaction_profile', choices=['legacy', 'cooperative', 'soft_overlap'], default='legacy')
+    parser.add_argument(
+        '--interaction_profile',
+        choices=[
+            'legacy', 'cooperative', 'soft_overlap',
+            'togg_phase1', 'togg_phase2',
+            'togg_phase3', 'togg_full',
+        ],
+        default='legacy',
+    )
     parser.add_argument(
         '--ablation_profile',
         choices=['none', *ABLATION_PROFILES],
@@ -64,6 +72,7 @@ def _visibility_summary(values, visibility):
                 'mean_rms_tre_mm': float(selected.mean()) if len(selected) else None,
                 'std_rms_tre_mm': float(selected.std()) if len(selected) else None,
                 'success_rate_20mm': float((selected < 20.0).mean()) if len(selected) else None,
+                'success_rate_5mm': float((selected < 5.0).mean()) if len(selected) else None,
             }
         )
     return rows
@@ -88,6 +97,7 @@ def _method_summary(values, visibility, deformation):
                 'mean_rms_tre_mm': float(selected.mean()) if len(selected) else None,
                 'std_rms_tre_mm': float(selected.std()) if len(selected) else None,
                 'success_rate_20mm': float((selected < 20.0).mean()) if len(selected) else None,
+                'success_rate_5mm': float((selected < 5.0).mean()) if len(selected) else None,
             }
         )
     return {
@@ -95,6 +105,7 @@ def _method_summary(values, visibility, deformation):
         'mean_rms_tre_mm': float(values.mean()),
         'std_rms_tre_mm': float(values.std()),
         'success_rate_20mm': float((values < 20.0).mean()),
+        'success_rate_5mm': float((values < 5.0).mean()),
         'visibility_bins': _visibility_summary(values, visibility),
         'low_visibility_deformation_bins': deformation_rows,
     }
@@ -185,6 +196,7 @@ class Tester(SingleTester):
             **result,
             'RMS_TRE_mm': rms_tre,
             'SR_20mm': (rms_tre < 20.0).float(),
+            'SR_5mm': (rms_tre < 5.0).float(),
             'RRE': rre,
             'RTE': rte,
             'coarse_candidate_correct': coarse_candidate_correct.float(),
@@ -221,9 +233,14 @@ class Tester(SingleTester):
                 'deformation_mm': float(self.deformation[index]),
                 'rms_tre_mm': rms_tre,
                 'success_20mm': int(rms_tre < 20.0),
+                'success_5mm': int(rms_tre < 5.0),
                 'rre_deg': float(result['RRE'].detach().cpu()),
                 'rte': float(result['RTE'].detach().cpu()),
                 'pir': float(result['PIR']),
+                'candidate_recall_at_k': float(result['CR@K']),
+                'gt_mrr': (
+                    float(result['GT_MRR']) if 'GT_MRR' in result else None
+                ),
                 'ir': float(result['IR']),
                 'mean_point_displacement': float(result['RMSE']),
                 'rr': float(result['RR']),
@@ -261,6 +278,9 @@ class Tester(SingleTester):
                 'mean_rte': float(np.mean([row['rte'] for row in self.records])),
                 'rr': float(np.mean([row['rr'] for row in self.records])),
                 'mean_pir': float(np.mean([row['pir'] for row in self.records])),
+                'mean_candidate_recall_at_k': float(np.mean([
+                    row['candidate_recall_at_k'] for row in self.records
+                ])),
                 'mean_ir': float(np.mean([row['ir'] for row in self.records])),
                 'mean_point_displacement': float(np.mean([row['mean_point_displacement'] for row in self.records])),
                 'coarse_candidate_recall': float(
@@ -279,9 +299,14 @@ class Tester(SingleTester):
                 ),
             }
         )
+        gt_mrr_values = [
+            row['gt_mrr'] for row in self.records if row['gt_mrr'] is not None
+        ]
+        if gt_mrr_values:
+            summary['mean_gt_mrr'] = float(np.mean(gt_mrr_values))
         payload = {
-            'metric_schema_version': 3,
-            'metric_note': 'RR uses mean normalized source displacement < eval.rmse_threshold; SR@20mm uses volumetric RMS-TRE. Historical GeoTransformer RMSE is mean point displacement, not root mean square.',
+            'metric_schema_version': 4,
+            'metric_note': 'RR uses mean normalized source displacement < eval.rmse_threshold; SR@5mm and SR@20mm use volumetric RMS-TRE. coarse_candidate_recall is the legacy any-hit rate; mean_candidate_recall_at_k is GT-pair recall within the fixed Top-K budget.',
             'protocol': f"P2P paper {self.args.dataset.replace('_', '-')} rigid registration",
             'metric': 'RMS-TRE on paired volumetric fiducials, millimetres',
             'checkpoint': osp.abspath(self.args.snapshot),
@@ -298,6 +323,14 @@ class Tester(SingleTester):
                     'rtor_poincare',
                     'a3_geometry_bias',
                     'rtor_descriptor_update',
+                    'topology_attention',
+                    'overlap_cross_attention',
+                    'legacy_rtor_post_refine',
+                    'overlap_supervision_enabled',
+                    'coarse_ranking_enabled',
+                    'coarse_overlap_prior_enabled',
+                    'coarse_topology_compatibility_enabled',
+                    'ranking_loss_enabled',
                 )
             },
             'fine_matching': dict(self.cfg.fine_matching),
@@ -326,6 +359,7 @@ class Tester(SingleTester):
         np.save(osp.splitext(output_path)[0] + '_rms_tre_mm.npy', values)
         self.logger.critical(
             f'RTOR metrics: RMS-TRE={values.mean():.4f}+/-{values.std():.4f} mm, '
+            f'SR@5mm={(values < 5).mean():.4f}, '
             f'SR@20mm={(values < 20).mean():.4f}'
         )
         self.logger.info(f'Results written to {output_path} and {csv_path}')

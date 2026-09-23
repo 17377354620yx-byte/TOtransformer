@@ -32,7 +32,17 @@ class RPEMultiHeadAttention(nn.Module):
 
         self.dropout = build_dropout_layer(dropout)
 
-    def forward(self, input_q, input_k, input_v, embed_qk, key_weights=None, key_masks=None, attention_factors=None):
+    def forward(
+        self,
+        input_q,
+        input_k,
+        input_v,
+        embed_qk,
+        key_weights=None,
+        key_masks=None,
+        attention_factors=None,
+        attention_bias=None,
+    ):
         r"""Scaled Dot-Product Attention with Pre-computed Relative Positional Embedding (forward)
 
         Args:
@@ -56,6 +66,8 @@ class RPEMultiHeadAttention(nn.Module):
         attention_scores_p = torch.einsum('bhnc,bhnmc->bhnm', q, p)
         attention_scores_e = torch.einsum('bhnc,bhmc->bhnm', q, k)
         attention_scores = (attention_scores_e + attention_scores_p) / self.d_model_per_head ** 0.5
+        if attention_bias is not None:
+            attention_scores = attention_scores + attention_bias
         if attention_factors is not None:
             attention_scores = attention_factors.unsqueeze(1) * attention_scores
         if key_weights is not None:
@@ -88,6 +100,7 @@ class RPEAttentionLayer(nn.Module):
         memory_weights=None,
         memory_masks=None,
         attention_factors=None,
+        attention_bias=None,
     ):
         hidden_states, attention_scores = self.attention(
             input_states,
@@ -97,6 +110,7 @@ class RPEAttentionLayer(nn.Module):
             key_weights=memory_weights,
             key_masks=memory_masks,
             attention_factors=attention_factors,
+            attention_bias=attention_bias,
         )
         hidden_states = self.linear(hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -118,6 +132,7 @@ class RPETransformerLayer(nn.Module):
         memory_weights=None,
         memory_masks=None,
         attention_factors=None,
+        attention_bias=None,
     ):
         hidden_states, attention_scores = self.attention(
             input_states,
@@ -126,6 +141,7 @@ class RPETransformerLayer(nn.Module):
             memory_weights=memory_weights,
             memory_masks=memory_masks,
             attention_factors=attention_factors,
+            attention_bias=attention_bias,
         )
         output_states = self.output(hidden_states)
         return output_states, attention_scores

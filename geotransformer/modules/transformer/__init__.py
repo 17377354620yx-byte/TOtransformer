@@ -17,3 +17,6 @@ from geotransformer.modules.transformer.vanilla_transformer import (
     TransformerEncoder,
     TransformerDecoder,
 )
+from geotransformer.modules.transformer.topology_conditioner import (
+    TopologyOverlapConditioner,
+)

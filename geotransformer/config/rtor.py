@@ -8,7 +8,19 @@ from easydict import EasyDict as edict
 
 _C = edict()
 _C.seed = 7351
-_C.ablation = edict(rtor_enabled=True, a3_enabled=True, architecture='rtor_a3')
+_C.ablation = edict(
+    rtor_enabled=True,
+    a3_enabled=True,
+    architecture='rtor_a3',
+    topology_attention=False,
+    overlap_cross_attention=False,
+    legacy_rtor_post_refine=True,
+    overlap_supervision_enabled=True,
+    coarse_ranking_enabled=False,
+    coarse_overlap_prior_enabled=False,
+    coarse_topology_compatibility_enabled=False,
+    ranking_loss_enabled=False,
+)
 
 _C.working_dir = osp.dirname(osp.realpath(__file__))
 _C.root_dir = osp.dirname(osp.dirname(_C.working_dir))
@@ -76,6 +88,13 @@ _C.coarse_matching.overlap_threshold = 0.1
 _C.coarse_matching.num_correspondences = 256
 _C.coarse_matching.dual_normalization = True
 
+_C.coarse_ranking = edict()
+_C.coarse_ranking.hidden_dim = 64
+_C.coarse_ranking.margin = 0.1
+_C.coarse_ranking.temperature = 0.1
+_C.coarse_ranking.boundary_window = 16
+_C.coarse_ranking.weight_loss = 0.5
+
 _C.geotransformer = edict()
 _C.geotransformer.input_dim = 1024
 _C.geotransformer.hidden_dim = 256
@@ -97,6 +116,7 @@ _C.topology_overlap.score_power = 1.0
 _C.topology_overlap.positive_overlap = 0.1
 _C.topology_overlap.focal_gamma = 2.0
 _C.topology_overlap.weight_loss = 0.5
+_C.topology_overlap.attention_hidden_dim = 64
 
 _C.overlap_selection = edict()
 _C.overlap_selection.enabled = True
@@ -159,6 +179,14 @@ def _validate(cfg) -> None:
         raise ValueError('overlap_selection.min_spread must be in [0, 1]')
     if cfg.fine_refiner.geometry_sigma <= 0:
         raise ValueError('fine_refiner.geometry_sigma must be positive')
+    if cfg.coarse_ranking.hidden_dim <= 0:
+        raise ValueError('coarse_ranking.hidden_dim must be positive')
+    if cfg.coarse_ranking.temperature <= 0:
+        raise ValueError('coarse_ranking.temperature must be positive')
+    if cfg.coarse_ranking.boundary_window <= 0:
+        raise ValueError('coarse_ranking.boundary_window must be positive')
+    if cfg.coarse_ranking.weight_loss < 0:
+        raise ValueError('coarse_ranking.weight_loss must be non-negative')
 
 
 def make_cfg():

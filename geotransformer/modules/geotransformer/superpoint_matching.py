@@ -32,6 +32,7 @@ class SuperPointMatching(nn.Module):
         src_masks=None,
         ref_weights=None,
         src_weights=None,
+        precomputed_scores=None,
     ):
         r"""Extract global Top-K superpoint correspondences."""
         if ref_masks is None:
@@ -52,17 +53,26 @@ class SuperPointMatching(nn.Module):
         if src_weights is not None:
             src_weights = src_weights[src_indices].clamp_min(1e-6)
 
-        matching_scores = torch.exp(
-            -pairwise_distance(ref_feats, src_feats, normalized=True)
-        )
-        if self.dual_normalization:
-            ref_scores = matching_scores / matching_scores.sum(
-                dim=1, keepdim=True
-            ).clamp_min(1e-12)
-            src_scores = matching_scores / matching_scores.sum(
-                dim=0, keepdim=True
-            ).clamp_min(1e-12)
-            matching_scores = ref_scores * src_scores
+        if precomputed_scores is None:
+            matching_scores = torch.exp(
+                -pairwise_distance(ref_feats, src_feats, normalized=True)
+            )
+            if self.dual_normalization:
+                ref_scores = matching_scores / matching_scores.sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1e-12)
+                src_scores = matching_scores / matching_scores.sum(
+                    dim=0, keepdim=True
+                ).clamp_min(1e-12)
+                matching_scores = ref_scores * src_scores
+        else:
+            expected_shape = (ref_masks.shape[0], src_masks.shape[0])
+            if precomputed_scores.shape != expected_shape:
+                raise ValueError(
+                    'precomputed_scores must have shape '
+                    f'{expected_shape}, got {tuple(precomputed_scores.shape)}'
+                )
+            matching_scores = precomputed_scores[ref_indices][:, src_indices]
         matching_scores = self._calibrate_scores(
             matching_scores, ref_weights, src_weights
         )

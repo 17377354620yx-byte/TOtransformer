@@ -54,6 +54,14 @@ class Trainer(EpochBasedTrainer):
                                 'rtor_poincare',
                                 'a3_geometry_bias',
                                 'rtor_descriptor_update',
+                                'topology_attention',
+                                'overlap_cross_attention',
+                                'legacy_rtor_post_refine',
+                                'overlap_supervision_enabled',
+                                'coarse_ranking_enabled',
+                                'coarse_overlap_prior_enabled',
+                                'coarse_topology_compatibility_enabled',
+                                'ranking_loss_enabled',
                             )
                         },
                         neighbor_limits=[int(x) for x in limits], seed=int(cfg.seed),
@@ -108,18 +116,33 @@ class Trainer(EpochBasedTrainer):
         allowed_prefixes = (
             'module.topology_overlap_refiner.',
             'module.fine_local_refiner.',
+            'module.transformer.conditioner.',
+            'module.coarse_ranker.',
         ) if self.distributed else (
             'topology_overlap_refiner.',
             'fine_local_refiner.',
+            'transformer.conditioner.',
+            'coarse_ranker.',
         )
         missing = list(incompatibility.missing_keys)
         required_missing = [
             key for key in missing if not key.startswith(allowed_prefixes)
         ]
         unexpected = list(incompatibility.unexpected_keys)
-        if unexpected:
+        legacy_prefix = (
+            'module.topology_overlap_refiner.'
+            if self.distributed else 'topology_overlap_refiner.'
+        )
+        required_unexpected = [
+            key for key in unexpected
+            if not (
+                self.cfg.ablation.get('topology_attention', False)
+                and key.startswith(legacy_prefix)
+            )
+        ]
+        if required_unexpected:
             raise RuntimeError(
-                f"Unexpected keys in warm start: {sorted(unexpected)}"
+                f"Unexpected keys in warm start: {sorted(required_unexpected)}"
             )
         if required_missing:
             raise RuntimeError(
@@ -167,7 +190,15 @@ def main():
     parser.add_argument('--architecture', choices=['geotransformer', 'rtor_only', 'a3_only', 'rtor_a3'], default='rtor_a3')
     parser.add_argument('--registration_profile', choices=['legacy', 'tight', 'robust'], default='legacy')
     parser.add_argument('--dual_encoder', action='store_true')
-    parser.add_argument('--interaction_profile', choices=['legacy', 'cooperative', 'soft_overlap'], default='legacy')
+    parser.add_argument(
+        '--interaction_profile',
+        choices=[
+            'legacy', 'cooperative', 'soft_overlap',
+            'togg_phase1', 'togg_phase2',
+            'togg_phase3', 'togg_full',
+        ],
+        default='legacy',
+    )
     parser.add_argument(
         '--ablation_profile',
         choices=['none', *ABLATION_PROFILES],

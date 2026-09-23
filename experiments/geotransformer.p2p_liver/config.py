@@ -113,7 +113,15 @@ def make_cfg(
         raise ValueError(f'Unknown registration profile: {registration_profile}')
     cfg.model.registration_profile = registration_profile
     cfg.model.dual_encoder = bool(dual_encoder)
-    if interaction_profile not in ('legacy', 'cooperative', 'soft_overlap'):
+    if interaction_profile not in (
+        'legacy',
+        'cooperative',
+        'soft_overlap',
+        'togg_phase1',
+        'togg_phase2',
+        'togg_phase3',
+        'togg_full',
+    ):
         raise ValueError(f'Unknown interaction profile: {interaction_profile}')
     _configure_ablation(cfg, ablation_profile)
     if ablation_profile != 'none' and (
@@ -129,6 +137,34 @@ def make_cfg(
     if interaction_profile == 'cooperative' and (architecture != 'rtor_a3' or dual_encoder or registration_profile != 'legacy'):
         raise ValueError('Cooperative profile uses single-encoder RTOR+A3 and the original LGR settings')
     cfg.model.interaction_profile = interaction_profile
+    conditioned_profile = interaction_profile in (
+        'togg_phase1', 'togg_phase2', 'togg_phase3', 'togg_full'
+    )
+    if conditioned_profile and not cfg.ablation.rtor_enabled:
+        raise ValueError(
+            'TOGGT profiles require architecture=rtor_only or rtor_a3 so the '
+            'master RTOR switch controls all added behavior'
+        )
+    cfg.ablation.topology_attention = conditioned_profile
+    cfg.ablation.overlap_cross_attention = interaction_profile in (
+        'togg_phase2', 'togg_phase3', 'togg_full'
+    )
+    cfg.ablation.coarse_ranking_enabled = interaction_profile in (
+        'togg_phase3', 'togg_full'
+    )
+    cfg.ablation.coarse_overlap_prior_enabled = (
+        cfg.ablation.coarse_ranking_enabled
+    )
+    cfg.ablation.coarse_topology_compatibility_enabled = (
+        cfg.ablation.coarse_ranking_enabled
+    )
+    cfg.ablation.ranking_loss_enabled = interaction_profile == 'togg_full'
+    cfg.ablation.legacy_rtor_post_refine = (
+        cfg.ablation.rtor_enabled and not conditioned_profile
+    )
+    cfg.ablation.overlap_supervision_enabled = (
+        cfg.ablation.rtor_enabled and interaction_profile != 'togg_phase1'
+    )
     cfg.coarse_matching.predicted_ratio_max = (
         .25
         if interaction_profile == 'cooperative'
@@ -139,7 +175,10 @@ def make_cfg(
     cfg.coarse_matching.exposure_end_epoch = 20
     # Keep historical loss weights by default: checkpoint probes did not show
     # sustained gradient conflict or an over-dominant overlap objective.
-    if interaction_profile in ('cooperative', 'soft_overlap'):
+    if interaction_profile in (
+        'cooperative', 'soft_overlap', 'togg_phase1', 'togg_phase2',
+        'togg_phase3', 'togg_full'
+    ):
         cfg.overlap_selection.enabled = False
     if registration_profile == 'tight':
         cfg.fine_matching.acceptance_radius = 0.06

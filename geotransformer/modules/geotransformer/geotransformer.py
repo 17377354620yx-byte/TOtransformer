@@ -4,6 +4,9 @@ import torch.nn as nn
 
 from geotransformer.modules.ops import pairwise_distance
 from geotransformer.modules.transformer import SinusoidalPositionalEmbedding, RPEConditionalTransformer
+from geotransformer.modules.transformer.topology_conditioner import (
+    TopologyOverlapConditioner,
+)
 
 
 class GeometricStructureEmbedding(nn.Module):
@@ -86,6 +89,11 @@ class GeometricTransformer(nn.Module):
         dropout=None,
         activation_fn='ReLU',
         reduction_a='max',
+        topology_attention=False,
+        overlap_attention=False,
+        topology_num_neighbors=8,
+        topology_hidden_dim=64,
+        poincare_curvature=1.0,
     ):
         r"""Geometric Transformer (GeoTransformer).
 
@@ -109,6 +117,18 @@ class GeometricTransformer(nn.Module):
         self.transformer = RPEConditionalTransformer(
             blocks, hidden_dim, num_heads, dropout=dropout, activation_fn=activation_fn
         )
+        self.conditioner = None
+        if topology_attention:
+            self.conditioner = TopologyOverlapConditioner(
+                feature_dim=hidden_dim,
+                num_heads=num_heads,
+                num_self_blocks=blocks.count('self'),
+                num_cross_blocks=blocks.count('cross'),
+                num_neighbors=topology_num_neighbors,
+                hidden_dim=topology_hidden_dim,
+                poincare_curvature=poincare_curvature,
+                overlap_attention=overlap_attention,
+            )
         self.out_proj = nn.Linear(hidden_dim, output_dim)
 
     def forward(
@@ -140,16 +160,26 @@ class GeometricTransformer(nn.Module):
         ref_feats = self.in_proj(ref_feats)
         src_feats = self.in_proj(src_feats)
 
-        ref_feats, src_feats = self.transformer(
+        transformer_outputs = self.transformer(
             ref_feats,
             src_feats,
             ref_embeddings,
             src_embeddings,
             masks0=ref_masks,
             masks1=src_masks,
+            conditioner=self.conditioner,
+            points0=ref_points,
+            points1=src_points,
         )
+        if self.conditioner is None:
+            ref_feats, src_feats = transformer_outputs
+            diagnostics = None
+        else:
+            ref_feats, src_feats, diagnostics = transformer_outputs
 
         ref_feats = self.out_proj(ref_feats)
         src_feats = self.out_proj(src_feats)
 
+        if diagnostics is not None:
+            return ref_feats, src_feats, diagnostics
         return ref_feats, src_feats

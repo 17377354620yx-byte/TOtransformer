@@ -143,16 +143,80 @@ class TopologyOverlapLoss(nn.Module):
         return ref_loss + src_loss
 
 
+class CandidateRankingLoss(nn.Module):
+    """Budget-aware surrogate for placing GT pairs inside global Top-K."""
+
+    def __init__(self, cfg) -> None:
+        super().__init__()
+        self.positive_overlap = float(cfg.coarse_loss.positive_overlap)
+        self.num_correspondences = int(cfg.coarse_matching.num_correspondences)
+        self.margin = float(cfg.coarse_ranking.margin)
+        self.temperature = float(cfg.coarse_ranking.temperature)
+        self.boundary_window = int(cfg.coarse_ranking.boundary_window)
+        if self.temperature <= 0:
+            raise ValueError('coarse_ranking.temperature must be positive')
+        if self.boundary_window <= 0:
+            raise ValueError('coarse_ranking.boundary_window must be positive')
+
+    def forward(self, output_dict):
+        logits = output_dict['coarse_ranking_logits']
+        valid_pairs = output_dict['coarse_valid_pair_masks']
+        overlaps = torch.zeros_like(logits)
+        corr_indices = output_dict['gt_node_corr_indices'].detach()
+        corr_overlaps = output_dict['gt_node_corr_overlaps'].detach().to(logits)
+        if corr_indices.numel():
+            overlaps[corr_indices[:, 0], corr_indices[:, 1]] = corr_overlaps
+
+        positive_mask = (overlaps > self.positive_overlap) & valid_pairs
+        negative_mask = (overlaps == 0) & valid_pairs
+        positive_scores = logits[positive_mask]
+        positive_overlaps = overlaps[positive_mask]
+        negative_scores = logits[negative_mask]
+        if positive_scores.numel() == 0 or negative_scores.numel() == 0:
+            return logits[valid_pairs].sum() * 0.0
+
+        target_count = min(self.num_correspondences, positive_scores.numel())
+        if positive_scores.numel() > target_count:
+            target_indices = positive_overlaps.topk(target_count).indices
+            positive_scores = positive_scores[target_indices]
+            positive_overlaps = positive_overlaps[target_indices]
+
+        # If P positives must enter a K-sized list, each should outrank the
+        # (K-P+1)-th negative. Average a small boundary window to distribute
+        # gradients among hard negatives without changing the target budget.
+        negative_slots = max(1, self.num_correspondences - target_count + 1)
+        negative_slots = min(negative_slots, negative_scores.numel())
+        boundary_values = negative_scores.topk(negative_slots).values
+        window = min(self.boundary_window, boundary_values.numel())
+        negative_boundary = boundary_values[-window:].mean()
+
+        violations = F.softplus(
+            (
+                negative_boundary
+                + self.margin
+                - positive_scores
+            )
+            / self.temperature
+        ) * self.temperature
+        weights = positive_overlaps.clamp_min(1e-12).sqrt()
+        return (violations * weights).sum() / weights.sum().clamp_min(1e-12)
+
+
 class OverallLoss(nn.Module):
     def __init__(self, cfg) -> None:
         super().__init__()
         self.coarse_loss = CoarseMatchingLoss(cfg)
         self.fine_loss = FineMatchingLoss(cfg)
         self.overlap_loss = TopologyOverlapLoss(cfg)
+        self.ranking_loss = CandidateRankingLoss(cfg)
         self.weight_coarse = float(cfg.loss.weight_coarse_loss)
         self.weight_fine = float(cfg.loss.weight_fine_loss)
         self.weight_overlap = float(cfg.topology_overlap.weight_loss)
-        self.rtor_enabled = bool(cfg.ablation.rtor_enabled)
+        self.rtor_enabled = bool(
+            cfg.ablation.get('overlap_supervision_enabled', cfg.ablation.rtor_enabled)
+        )
+        self.ranking_enabled = bool(cfg.ablation.get('ranking_loss_enabled', False))
+        self.weight_ranking = float(cfg.coarse_ranking.weight_loss)
 
     def forward(self, output_dict, data_dict):
         coarse_loss = self.coarse_loss(output_dict)
@@ -160,16 +224,23 @@ class OverallLoss(nn.Module):
         overlap_loss = (self.overlap_loss(output_dict)
                         if self.rtor_enabled
                         else coarse_loss.new_zeros(()))
+        ranking_loss = (
+            self.ranking_loss(output_dict)
+            if self.ranking_enabled
+            else coarse_loss.new_zeros(())
+        )
         total_loss = (
             self.weight_coarse * coarse_loss
             + self.weight_fine * fine_loss
             + self.weight_overlap * overlap_loss
+            + self.weight_ranking * ranking_loss
         )
         return {
             'loss': total_loss,
             'c_loss': coarse_loss,
             'f_loss': fine_loss,
             'o_loss': overlap_loss,
+            'r_loss': ranking_loss,
         }
 
 
@@ -179,6 +250,7 @@ class Evaluator(nn.Module):
         self.acceptance_overlap = float(cfg.eval.acceptance_overlap)
         self.acceptance_radius = float(cfg.eval.acceptance_radius)
         self.acceptance_rmse = float(cfg.eval.rmse_threshold)
+        self.ranking_positive_overlap = float(cfg.coarse_loss.positive_overlap)
 
     @torch.no_grad()
     def evaluate_coarse(self, output_dict):
@@ -196,6 +268,59 @@ class Evaluator(nn.Module):
             output_dict['ref_node_corr_indices'],
             output_dict['src_node_corr_indices'],
         ].mean()
+
+    @torch.no_grad()
+    def evaluate_candidate_recall(self, output_dict):
+        gt_mask = (
+            output_dict['gt_node_corr_overlaps']
+            > self.ranking_positive_overlap
+        )
+        gt_indices = output_dict['gt_node_corr_indices'][gt_mask]
+        if gt_indices.numel() == 0:
+            return output_dict['ref_points_c'].new_zeros(())
+        predicted = torch.stack(
+            [
+                output_dict['ref_node_corr_indices'],
+                output_dict['src_node_corr_indices'],
+            ],
+            dim=1,
+        )
+        if predicted.numel() == 0:
+            return output_dict['ref_points_c'].new_zeros(())
+        hits = (gt_indices[:, None, :] == predicted[None, :, :]).all(dim=2)
+        return hits.any(dim=1).float().mean()
+
+    @torch.no_grad()
+    def evaluate_gt_mrr(self, output_dict):
+        logits = output_dict['coarse_ranking_logits']
+        valid_pairs = output_dict['coarse_valid_pair_masks']
+        gt_mask = (
+            output_dict['gt_node_corr_overlaps']
+            > self.ranking_positive_overlap
+        )
+        gt_indices = output_dict['gt_node_corr_indices'][gt_mask]
+        if gt_indices.numel() == 0:
+            return logits.new_zeros(())
+        gt_pair_valid = valid_pairs[gt_indices[:, 0], gt_indices[:, 1]]
+        gt_indices = gt_indices[gt_pair_valid]
+        if gt_indices.numel() == 0:
+            return logits.new_zeros(())
+        valid_linear_indices = torch.nonzero(
+            valid_pairs.reshape(-1), as_tuple=True
+        )[0]
+        valid_scores = logits.reshape(-1)[valid_linear_indices]
+        order = valid_scores.argsort(descending=True)
+        rank_by_linear_index = torch.zeros(
+            logits.numel(), dtype=torch.long, device=logits.device
+        )
+        rank_by_linear_index[valid_linear_indices[order]] = torch.arange(
+            1, valid_scores.numel() + 1, device=logits.device
+        )
+        gt_linear_indices = (
+            gt_indices[:, 0] * logits.shape[1] + gt_indices[:, 1]
+        )
+        ranks = rank_by_linear_index[gt_linear_indices]
+        return ranks.float().reciprocal().mean()
 
     @torch.no_grad()
     def evaluate_fine(self, output_dict, data_dict):
@@ -226,14 +351,20 @@ class Evaluator(nn.Module):
         rre, rte, rmse, recall = self.evaluate_registration(
             output_dict, data_dict
         )
-        return {
+        results = {
             'PIR': self.evaluate_coarse(output_dict),
+            'CR@K': self.evaluate_candidate_recall(output_dict),
             'IR': self.evaluate_fine(output_dict, data_dict),
             'RRE': rre,
             'RTE': rte,
             'RMSE': rmse,
             'RR': recall,
         }
+        if 'coarse_ranking_logits' in output_dict:
+            results['GT_MRR'] = self.evaluate_gt_mrr(output_dict)
+        return results
 
 
-__all__ = ['Evaluator', 'OverallLoss', 'TopologyOverlapLoss']
+__all__ = [
+    'CandidateRankingLoss', 'Evaluator', 'OverallLoss', 'TopologyOverlapLoss'
+]
